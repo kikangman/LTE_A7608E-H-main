@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "AtCommands.h"
+#include <TinyGPS++.h>
 
 // ESP32 pin mapping for SIMCom A7608E-H
 static constexpr int MODEM_TX_PIN = 8;   // ESP32 -> Modem RX
@@ -10,6 +11,9 @@ HardwareSerial &MODEM = Serial1;
 HardwareSerial &GNSS = Serial2;
 // AT command helper instance
 static AtCommands AT(MODEM, Serial);
+
+// TinyGPS++ GNSS parser
+static TinyGPSPlus gps;
 
 // Forward declarations
 static void runNetDiagnostics(const String &contrdp);
@@ -24,8 +28,8 @@ static String NTRIP_USER = "";                // your ID
 static String NTRIP_PASS = "";                // your password
 
 // GNSS UART config (RTCM output)
-static constexpr int GNSS_TX_PIN = 18; // ESP32 TX -> GNSS RX
-static constexpr int GNSS_RX_PIN = 17; // ESP32 RX <- GNSS TX (optional)
+static constexpr int GNSS_TX_PIN = 7; // ESP32 TX -> GNSS RX
+static constexpr int GNSS_RX_PIN = 6; // ESP32 RX <- GNSS TX (optional)
 static constexpr int GNSS_BAUD   = 115200;
 
 // NTRIP helpers
@@ -50,6 +54,10 @@ static bool httpsPostViaCipssl(const String &host, const String &path, const Str
 static bool httpsPutViaCipssl(const String &host, const String &path, const String &contentType, const String &body);
 static bool httpsPutViaCipssl(const String &host, const String &path, const String &contentType, const String &body);
 static const char *RTDB_HOST = "rtk-gnss-b864f-default-rtdb.firebaseio.com";
+static const char *RTDB_AUTH = ""; // optional auth token (leave empty if not used)
+static const char *RTDB_GNSS_PATH = "/devices/esp32-1/gnss"; // where to write GNSS data
+static const uint32_t GNSS_SEND_INTERVAL_MS = 10000; // 10 seconds
+static uint32_t lastGnssSendMs = 0;
 static String normalizeRtdbPath(const String &raw) {
   String p = raw;
   if (p.length() == 0) p = "/";
@@ -266,6 +274,7 @@ static bool ensurePdpAndHttpGet(const char *apn, const char *url) {
   }
   if (!cid1Active) {
     Serial.println(F("No active PDP context (CID 1) detected."));
+    
     return false;
   }
 
@@ -825,6 +834,12 @@ void setup() {
 }
 
 void loop() {
+  // Feed GNSS bytes into TinyGPS++
+  while (GNSS.available()) {
+    char c = (char)GNSS.read();
+    gps.encode(c);
+  }
+
   // Command parser on USB Serial; type !help for commands
   static String cmd;
   while (Serial.available()) {
@@ -1044,5 +1059,27 @@ void loop() {
   }
   while (MODEM.available()) {
     Serial.write(MODEM.read());
+  }
+
+  // Every 10 seconds, if we have a valid GNSS time, upload only time to Firebase RTDB
+  if (millis() - lastGnssSendMs >= GNSS_SEND_INTERVAL_MS) {
+    lastGnssSendMs = millis();
+    if (gps.date.isValid() && gps.time.isValid()) {
+      char ts[32];
+      snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+               gps.date.year(), gps.date.month(), gps.date.day(),
+               gps.time.hour(), gps.time.minute(), gps.time.second());
+
+      String json = String("{\"utc\":\"") + String(ts) + "\"}";
+
+      String path = normalizeRtdbPath(RTDB_GNSS_PATH);
+      path += "?print=silent";
+      if (RTDB_AUTH && *RTDB_AUTH) path += String("&auth=") + RTDB_AUTH;
+
+      bool ok = httpStackHttpsPut(RTDB_HOST, path, "application/json", json);
+      Serial.println(ok ? F("TIME -> RTDB PUT OK") : F("TIME -> RTDB PUT FAIL"));
+    } else {
+      Serial.println(F("GNSS time not ready; skipping upload"));
+    }
   }
 }
